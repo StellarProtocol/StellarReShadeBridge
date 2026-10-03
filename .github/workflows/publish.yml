@@ -1,0 +1,84 @@
+name: publish
+# Build the add-on (same steps as build.yml) on a version tag, then publish it to the public
+# `stellar` MinIO bucket, gated on the Production environment.
+#
+# build  : runs on tag push — compile + validate, no approval.
+# publish: gated on the Production environment (required reviewers = the real-device smoke),
+#          uploads the add-on + its license to deps/stellar-reshade-bridge/<version>/.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: ReShade 6.8.0 add-on headers
+        run: git clone --depth 1 --branch v6.8.0 https://github.com/crosire/reshade.git rs
+      - name: Build
+        run: cl /nologo /LD /std:c++17 /EHsc /O2 /DNDEBUG /I rs\include src\bridge.cpp /Fe:Stellar.ReShadeBridge.addon64 /link user32.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stellar.ReShadeBridge.addon64
+          path: Stellar.ReShadeBridge.addon64
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment = the real-device smoke gate.
+    environment: Production
+    env:
+      # Cloudflare R2: writes go to s3://$BUCKET via $S3_ENDPOINT; public reads come from the
+      # custom domain bound to the bucket root.
+      S3_ENDPOINT: https://757f61fd2bda67f9a3bc7c3b9b8d62e1.r2.cloudflarestorage.com
+      BUCKET: cdn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Stellar.ReShadeBridge.addon64
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Publish add-on + license to MinIO
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # MinIO rejects AWS CLI v2 default multipart checksums — opt out.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY="deps/stellar-reshade-bridge/$VERSION"
+          aws s3 cp Stellar.ReShadeBridge.addon64 "s3://$BUCKET/$KEY/Stellar.ReShadeBridge.addon64" --endpoint-url "$S3_ENDPOINT"
+          aws s3 cp LICENSE "s3://$BUCKET/$KEY/LICENSE" --endpoint-url "$S3_ENDPOINT"
+
+      - name: Record sha256 + size in job summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(sha256sum Stellar.ReShadeBridge.addon64 | cut -d' ' -f1)
+          SIZE=$(stat -c%s Stellar.ReShadeBridge.addon64)
+          {
+            echo "### Stellar.ReShadeBridge.addon64"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| size (bytes) | $SIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
