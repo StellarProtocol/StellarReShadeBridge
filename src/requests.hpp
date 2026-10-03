@@ -133,6 +133,20 @@ namespace stellar_rsb
             g_known_empty = false;
         }
 
+        // Writes a pending save before a request that would lose it (preset switch, reload). Caller guarantees count > 0
+        // and not loading. Returns false if a save is needed but the bridge already saved this frame.
+        inline bool flush_pending_save(reshade::api::effect_runtime *r, bool &saved)
+        {
+            if (!g_save_pending)
+                return true;
+            if (saved)
+                return false;
+            save_without_overrides(r);
+            g_save_pending = false;
+            saved = true;
+            return true;
+        }
+
         inline void put_back(std::vector<Request> &requests, size_t from)
         {
             if (g_requests.put_back_front(requests, from) != 0)
@@ -184,21 +198,22 @@ namespace stellar_rsb
                     log_warning("Stellar ReShade bridge: preset request ignored because ReShade has no techniques loaded.");
                     break;
                 }
-                if (g_save_pending)
+                // Save before switching: re-selecting the same preset reloads it from disk and would drop the change.
+                if (!detail::flush_pending_save(r, saved))
                 {
-                    // Save before switching: re-selecting the same preset reloads it from disk and would drop the change.
-                    if (saved)
-                    {
-                        detail::put_back(requests, i); // one bridge save per frame: switch next frame
-                        return saved;
-                    }
-                    detail::save_without_overrides(r);
-                    g_save_pending = false;
-                    saved = true;
+                    detail::put_back(requests, i); // one bridge save per frame: switch next frame
+                    return saved;
                 }
                 detail::switch_preset(r, q.text);
                 break;
             case RequestKind::search_paths:
+                // Save before reloading: the reload restores the preset's states (load_current_preset after loading,
+                // source/runtime.cpp:3723) and would drop a saved change that was not written yet.
+                if (count != 0 && !detail::flush_pending_save(r, saved))
+                {
+                    detail::put_back(requests, i); // one bridge save per frame: change paths next frame
+                    return saved;
+                }
                 detail::apply_search_paths(r, q); // sets g_reload_requested: the next iteration stops the batch
                 break;
             }
