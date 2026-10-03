@@ -21,7 +21,7 @@ namespace stellar_rsb
     enum class RequestKind
     {
         effects_enabled, // on = global effects on/off
-        technique,       // text = technique name, on = enabled, save = persist to the preset
+        technique,       // effect = effect file name ("" = any), text = technique name, on = enabled, save = persist
         preset,          // text = preset path
         search_paths,    // text = effect search paths, text2 = texture search paths (';'-separated, either may be empty)
     };
@@ -29,6 +29,7 @@ namespace stellar_rsb
     struct Request
     {
         RequestKind kind = RequestKind::effects_enabled;
+        std::string effect;
         std::string text;
         std::string text2;
         bool on = false;

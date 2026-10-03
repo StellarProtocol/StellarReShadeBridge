@@ -5,13 +5,21 @@
 //   * Every ReShade call that CHANGES state (technique toggles, effects on/off, preset, search paths) runs on the render
 //     thread inside ReShade's own present path (the reshade_present event). The exported rsb_request_* functions only
 //     enqueue requests.
-//   * Requests are applied only while ReShade is not loading (the technique list is non-empty), all of them, in request
-//     order. If any applied request asked to be saved, save_current_preset() is called exactly once for that frame.
+//   * Requests are applied only while ReShade is not loading, in request order. If any applied request asked to be
+//     saved, the preset is saved exactly once for that frame — with temporary overrides reverted around the save.
 //   * The exported getters read a snapshot that the reshade_present callback refreshes every frame.
 //   * The Unity render-event callback (rsb_render_event_func) runs on the host's render thread and is the only other
 //     place that touches the runtime.
 //   * Locks are held only to swap or copy small data. The add-on never calls back into the host, and no C++ exception
 //     crosses the ABI or a ReShade callback.
+//
+// Loading state (ReShade 6.8.0 has no public is_loading()):
+//   * Set at init_effect_runtime and whenever the bridge itself asks ReShade to reload effects.
+//   * reshade_reloaded_effects fires when a reload starts (technique list empty) and when it finishes (techniques
+//     listed). At the start event the bridge checks whether ReShade has any effect files to load (effect_files.hpp):
+//     none means ReShade is done and simply has no techniques ("loaded, empty"), so requests can still apply.
+//   * Whenever the technique list can be enumerated, ReShade is not loading (enumerate_techniques returns nothing while
+//     it loads). An empty list is treated as loading unless the bridge established "loaded, empty" as above.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
@@ -22,6 +30,8 @@
 #include <vector>
 #include <reshade.hpp>
 #include "bridge_state.hpp"
+#include "effect_files.hpp"
+#include "overrides.hpp"
 
 using namespace reshade::api;
 using namespace stellar_rsb;
@@ -35,6 +45,16 @@ static std::atomic<effect_runtime *> g_runtime{ nullptr };
 static RequestQueue g_requests;
 static SnapshotStore g_snapshot;
 
+// ---- loading state (written from ReShade events) ----
+static std::atomic<bool> g_loading{ true };      // a load is (or may be) in progress
+static std::atomic<bool> g_known_empty{ false }; // ReShade finished and has no effect files: an empty list is not loading
+static std::atomic<bool> g_reset_overrides{ false };
+static std::atomic<DWORD> g_render_thread{ 0 };
+
+// ---- render-thread state ----
+static TemporaryOverrides g_overrides;
+static bool g_was_loading = true;
+
 // ---- offscreen render (host render thread) ----
 struct PendingRender { void *texture; uint32_t width, height; };
 static std::mutex g_render_lock;
@@ -44,18 +64,7 @@ static std::atomic<bool> g_counting{ false };
 static std::atomic<int> g_drawn{ 0 };
 
 // ---------------------------------------------------------------------------------------------------------------------
-// ReShade string helpers (size query, then fill).
-
-template <typename Getter>
-static void read_string(std::string &out, Getter get)
-{
-    size_t size = 0;
-    get(nullptr, &size); // size includes the terminating NUL
-    if (size <= 1) { out.clear(); return; }
-    out.resize(size);
-    get(&out[0], &size); // size now = characters copied
-    out.resize(size);
-}
+// Snapshot.
 
 static size_t count_techniques(effect_runtime *r)
 {
@@ -63,6 +72,11 @@ static size_t count_techniques(effect_runtime *r)
     // enumerate_techniques returns nothing while ReShade is loading (runtime_api.cpp: `if (is_loading()) return;`).
     r->enumerate_techniques(nullptr, [](effect_runtime *, effect_technique, void *u) { ++*static_cast<size_t *>(u); }, &n);
     return n;
+}
+
+static bool is_loading_now(size_t technique_count)
+{
+    return g_loading.load() || (technique_count == 0 && !g_known_empty.load());
 }
 
 struct SnapshotFill { Snapshot *snap; size_t index; };
@@ -77,37 +91,61 @@ static void fill_snapshot(effect_runtime *r, Snapshot &snap)
             if (f->snap->techniques.size() <= f->index)
                 f->snap->techniques.emplace_back();
             TechniqueState &s = f->snap->techniques[f->index];
-            read_string(s.name, [&](char *b, size_t *n) { rt->get_technique_name(t, b, n); });
-            read_string(s.effect, [&](char *b, size_t *n) { rt->get_technique_effect_name(t, b, n); });
+            read_reshade_string(s.name, [&](char *b, size_t *n) { rt->get_technique_name(t, b, n); });
+            // The effect FILE name exactly as ReShade reports it (e.g. "Clarity.fx"); hosts use it to find the source.
+            read_reshade_string(s.effect, [&](char *b, size_t *n) { rt->get_technique_effect_name(t, b, n); });
             s.enabled = rt->get_technique_state(t);
             f->index++;
         }
         catch (...) {} // never unwind through ReShade's enumeration loop
     }, &fill);
     snap.technique_count = fill.index;
-    snap.loading = fill.index == 0; // no public is_loading API in 6.8.0 — inferred from "0 techniques enumerated"
+    snap.loading = is_loading_now(fill.index);
     snap.effects_enabled = r->get_effects_state();
-    read_string(snap.preset_path, [&](char *b, size_t *n) { r->get_current_preset_path(b, n); });
+    read_reshade_string(snap.preset_path, [&](char *b, size_t *n) { r->get_current_preset_path(b, n); });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Request application (render thread, inside reshade_present, only while not loading).
 
-struct TechniqueMatch { const char *name; bool on; std::string scratch; };
+struct TechniqueMatch { const Request *q; TechniqueKey key; };
 
 static void apply_technique(effect_runtime *r, const Request &q)
 {
-    TechniqueMatch m{ q.text.c_str(), q.on, {} };
+    TechniqueMatch m{ &q, {} };
     r->enumerate_techniques(nullptr, [](effect_runtime *rt, effect_technique t, void *u) {
         try
         {
             auto *m = static_cast<TechniqueMatch *>(u);
-            read_string(m->scratch, [&](char *b, size_t *n) { rt->get_technique_name(t, b, n); });
-            if (m->scratch == m->name)
-                rt->set_technique_state(t, m->on);
+            read_key(rt, t, m->key);
+            if (m->key.second != m->q->text)
+                return;
+            if (!m->q->effect.empty() && m->key.first != m->q->effect)
+                return; // an empty effect name matches any effect
+            g_overrides.apply(rt, t, m->key, m->q->on, m->q->save);
         }
         catch (...) {} // never unwind through ReShade's enumeration loop
     }, &m);
+}
+
+// Saves the current preset without the temporary overrides in it.
+static void save_without_overrides(effect_runtime *r)
+{
+    g_overrides.revert(r);
+    r->save_current_preset();
+    g_overrides.reapply(r);
+}
+
+// Switches preset. ReShade saves the old preset itself first, so the temporary overrides are reverted around it.
+static void switch_preset(effect_runtime *r, const std::string &path)
+{
+    g_overrides.revert(r);
+    {
+        ApplyingScope scope; // the preset load toggles techniques; those are not user changes
+        r->set_current_preset_path(path.c_str());
+    }
+    g_overrides.mark_rebase();
+    g_overrides.reapply(r);
 }
 
 // ';'-separated list -> '\0'-separated array for ReShade's config array setter. Returns false if the list has no entries.
@@ -129,7 +167,8 @@ static bool to_config_array(const std::string &list, std::string &out)
     return !out.empty();
 }
 
-static void apply_search_paths(effect_runtime *r, const Request &q)
+// Returns true if a reload was requested.
+static bool apply_search_paths(effect_runtime *r, const Request &q)
 {
     std::string array;
     bool changed = false;
@@ -144,40 +183,46 @@ static void apply_search_paths(effect_runtime *r, const Request &q)
         changed = true;
     }
     if (changed)
+    {
         r->reload_effect_next_frame(nullptr); // nullptr = reload all effects
+        g_loading = true;
+        g_known_empty = false;
+    }
+    return changed;
 }
 
-// Applies requests in order while ReShade stays out of loading. A request can start a reload (a preset switch can compile a
-// new permutation), so loading is re-checked before each one; the first request that meets a loading runtime and every
-// request after it go back to the front of the queue for a later frame. Returns true if an applied request asked to be saved.
+// Applies requests in order. Returns true if an applied request asked to be saved (the caller saves once).
+// A preset switch or a search-path change ends the batch: the rest waits for a later frame, where the loading gate is
+// evaluated again. A saved request followed by a preset switch is saved before the switch (re-selecting the same preset
+// reloads it from disk and would drop the change); that is the frame's one save.
 static bool apply_requests(effect_runtime *r, std::vector<Request> &requests)
 {
     bool save = false;
     for (size_t i = 0; i < requests.size(); ++i)
     {
-        if (i != 0 && count_techniques(r) == 0)
-        {
-            g_requests.put_back_front(requests, i);
-            break;
-        }
         const Request &q = requests[i];
         switch (q.kind)
         {
-        case RequestKind::effects_enabled: r->set_effects_state(q.on); break;
-        case RequestKind::technique: apply_technique(r, q); save = save || q.save; break;
+        case RequestKind::effects_enabled:
+            r->set_effects_state(q.on);
+            break;
+        case RequestKind::technique:
+            apply_technique(r, q);
+            save = save || q.save;
+            break;
         case RequestKind::preset:
             if (save)
+                save_without_overrides(r);
+            switch_preset(r, q.text);
+            g_requests.put_back_front(requests, i + 1);
+            return false;
+        case RequestKind::search_paths:
+            if (apply_search_paths(r, q))
             {
-                // Re-selecting the same preset reloads it from disk, which would drop the saved toggles applied above, so
-                // save them first. That is this frame's one save: the switch ends the batch and the rest waits a frame.
-                r->save_current_preset();
-                r->set_current_preset_path(q.text.c_str());
                 g_requests.put_back_front(requests, i + 1);
-                return false;
+                return save;
             }
-            r->set_current_preset_path(q.text.c_str());
             break;
-        case RequestKind::search_paths: apply_search_paths(r, q); break;
         }
     }
     return save;
@@ -186,13 +231,68 @@ static bool apply_requests(effect_runtime *r, std::vector<Request> &requests)
 // ---------------------------------------------------------------------------------------------------------------------
 // ReShade events.
 
-static void on_init(effect_runtime *r) { g_runtime = r; }
+static void on_init(effect_runtime *r)
+{
+    g_loading = true;
+    g_known_empty = false;
+    g_reset_overrides = true;
+    g_runtime = r;
+}
 
 static void on_destroy(effect_runtime *r)
 {
     effect_runtime *expected = r;
     if (g_runtime.compare_exchange_strong(expected, nullptr))
+    {
+        g_loading = true;
+        g_known_empty = false;
         g_snapshot.reset();
+    }
+}
+
+// Fired when a reload starts (old effects destroyed, technique list empty) and when the last effect of a reload has been
+// created (techniques listed). Runs on the render thread inside ReShade's update.
+static void on_reloaded_effects(effect_runtime *r)
+{
+    try
+    {
+        if (r != g_runtime.load())
+            return;
+        if (count_techniques(r) != 0)
+        {
+            g_loading = false; // the reload has finished
+            g_known_empty = false;
+        }
+        else if (!may_have_effect_files(r))
+        {
+            g_loading = false; // nothing to load: ReShade is done, with no techniques
+            g_known_empty = true;
+        }
+        else
+        {
+            g_loading = true; // a load is starting
+            g_known_empty = false;
+        }
+    }
+    catch (...)
+    {
+        g_loading = true;
+    }
+}
+
+// A technique changed by anyone but the bridge (overlay, hotkey, another add-on) ends any temporary override on it.
+static bool on_set_technique_state(effect_runtime *r, effect_technique t, bool)
+{
+    try
+    {
+        if (g_applying.load() || r != g_runtime.load() || GetCurrentThreadId() != g_render_thread.load() || g_overrides.empty())
+            return false;
+        TechniqueKey key;
+        read_key(r, t, key);
+        g_overrides.forget(key);
+    }
+    catch (...) {}
+    return false; // never block the change
 }
 
 // Render thread, inside ReShade's present (runtime.cpp on_present, right before _effects_rendered_this_frame resets).
@@ -202,23 +302,36 @@ static void on_reshade_present(effect_runtime *r)
     {
         if (r != g_runtime.load())
             return;
+        g_render_thread = GetCurrentThreadId();
+        if (g_reset_overrides.exchange(false))
+            g_overrides.clear();
 
         // Render-thread-private buffers, reused every frame to avoid per-frame allocation.
         static std::vector<Request> s_requests;
         static Snapshot s_work;
 
-        if (count_techniques(r) != 0) // not loading: apply everything queued so far, in order
+        const size_t count = count_techniques(r);
+        if (count != 0)
+        {
+            // Techniques can be listed only when ReShade is not loading.
+            g_loading = false;
+            g_known_empty = false;
+            if (g_was_loading)
+                g_overrides.reapply(r); // a reload restores the preset's states; temporary overrides come back
+        }
+
+        if (!is_loading_now(count))
         {
             s_requests.clear();
             g_requests.take_all(s_requests);
-            // At most once per frame, only when a saved request was applied (and never while loading).
             if (!s_requests.empty() && apply_requests(r, s_requests) && count_techniques(r) != 0)
-                r->save_current_preset();
+                save_without_overrides(r); // at most once per frame, only when a saved request was applied
             s_requests.clear();
         }
         // While loading, requests stay queued (in order) until a later frame.
 
         fill_snapshot(r, s_work);
+        g_was_loading = s_work.loading;
         g_snapshot.publish(s_work);
     }
     catch (...)
@@ -316,13 +429,15 @@ extern "C" __declspec(dllexport) int rsb_technique_count()
 }
 
 // Returns 1 and fills the buffers (NUL-terminated, truncated to fit), or 0 if `i` is out of range.
+// `effect` receives the effect FILE name exactly as ReShade reports it (e.g. "Clarity.fx").
 extern "C" __declspec(dllexport) int rsb_technique_at(int i, char *name, int nameLen, char *effect, int effectLen, int *enabled)
 {
     try { return g_snapshot.technique_at(i, name, nameLen, effect, effectLen, enabled); } catch (...) { return 0; }
 }
 
-// save = 0: temporary (not written to the preset); save = 1: saved to the current preset.
-extern "C" __declspec(dllexport) void rsb_request_technique(const char *name, int on, int save)
+// effect = effect file name, or null/"" for any effect. save = 0: temporary (never written to the preset);
+// save = 1: saved to the current preset.
+extern "C" __declspec(dllexport) void rsb_request_technique(const char *effect, const char *name, int on, int save)
 {
     try
     {
@@ -330,6 +445,7 @@ extern "C" __declspec(dllexport) void rsb_request_technique(const char *name, in
             return;
         Request q;
         q.kind = RequestKind::technique;
+        q.effect = effect ? effect : "";
         q.text = name;
         q.on = on != 0;
         q.save = save != 0;
@@ -385,6 +501,7 @@ extern "C" __declspec(dllexport) void rsb_queue_render(void *d3d11Texture, uint3
     catch (...) {}
 }
 
+// Meaningful only after the render event for that queue has run.
 // -1 no runtime, -2 nothing queued, -3 view creation failed, else the number of techniques drawn (0 = nothing drawn).
 extern "C" __declspec(dllexport) int rsb_last_render() { return g_last_render.load(); }
 
@@ -398,6 +515,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             return FALSE;
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy);
+        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
+        reshade::register_event<reshade::addon_event::reshade_set_technique_state>(on_set_technique_state);
         reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
     }
