@@ -1,0 +1,21 @@
+name: build
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: ReShade 6.8.0 add-on headers
+        run: git clone --depth 1 --branch v6.8.0 https://github.com/crosire/reshade.git rs
+      - name: Build
+        run: cl /nologo /LD /std:c++17 /EHsc /O2 /DNDEBUG /I rs\include src\bridge.cpp /Fe:Stellar.ReShadeBridge.addon64 /link user32.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stellar.ReShadeBridge.addon64
+          path: Stellar.ReShadeBridge.addon64
+          if-no-files-found: error
