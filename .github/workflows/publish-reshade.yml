@@ -1,5 +1,5 @@
 name: publish-reshade
-# Mirror a specific ReShade release's add-on-capable DLL + license to the public `stellar` MinIO
+# Mirror a specific ReShade release's add-on-capable DLL + license to the public CDN bucket
 # bucket, so the bridge's consumers don't depend on reshade.me at install time.
 #
 # Manually triggered: the caller supplies the ReShade version and the sha256 of its official
@@ -83,12 +83,12 @@ jobs:
           set -euo pipefail
           curl -fsSL -o LICENSE.txt "https://raw.githubusercontent.com/crosire/reshade/v${VERSION}/LICENSE.md"
 
-      - name: Publish ReShade64.dll + license to MinIO
+      - name: Publish ReShade64.dll + license
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
           AWS_DEFAULT_REGION: auto
-          # MinIO rejects AWS CLI v2 default multipart checksums — opt out.
+          # R2 rejects AWS CLI v2 default multipart checksums — opt out.
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
           VERSION: ${{ inputs.version }}
@@ -96,6 +96,11 @@ jobs:
         run: |
           set -euo pipefail
           KEY="deps/reshade/$VERSION"
+          # Release artifacts are immutable: never overwrite a published version.
+          if aws s3api head-object --bucket "$BUCKET" --key "$KEY/ReShade64.dll" --endpoint-url "$S3_ENDPOINT" >/dev/null 2>&1; then
+            echo "::error::$KEY already exists — published versions are immutable; bump the version instead"
+            exit 1
+          fi
           aws s3 cp ReShade64.dll "s3://$BUCKET/$KEY/ReShade64.dll" --endpoint-url "$S3_ENDPOINT"
           aws s3 cp LICENSE.txt "s3://$BUCKET/$KEY/LICENSE.txt" --endpoint-url "$S3_ENDPOINT"
 
