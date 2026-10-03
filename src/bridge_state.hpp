@@ -3,12 +3,15 @@
 // Two small hand-offs between threads:
 //   * RequestQueue: any thread (the framework) -> render thread. Callers push; the reshade_present callback swaps the
 //     whole queue out under the lock and applies it afterwards, outside the lock.
-//   * SnapshotStore: render thread -> any thread. The reshade_present callback builds a fresh Snapshot every frame in a
-//     private buffer and swaps it in under the lock; readers copy only the fields they need under the lock.
+//   * SnapshotStore: render thread -> any thread. The reshade_present callback rebuilds the Snapshot in a private buffer
+//     when something changed and swaps it in under the lock (otherwise it only advances the frame counter); readers copy
+//     only the fields they need under the lock.
 // Locks are held only to swap or copy small data. Nothing here calls into ReShade or into the caller.
 #pragma once
 
+#include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -36,20 +39,32 @@ namespace stellar_rsb
         bool save = false;
     };
 
+    enum class PushResult
+    {
+        queued,
+        dropped_first, // the queue is full; first drop since it last drained (worth one log line)
+        dropped,       // the queue is full; already reported
+    };
+
     class RequestQueue
     {
     public:
         // Upper bound on queued requests so a caller that keeps pushing while ReShade never finishes loading cannot grow
-        // memory without limit. Requests beyond it are dropped (push returns false).
+        // memory without limit. Requests beyond it are dropped.
         static constexpr std::size_t max_pending = 4096;
 
-        bool push(Request &&request)
+        PushResult push(Request &&request)
         {
             std::lock_guard<std::mutex> lock(_lock);
             if (_pending.size() >= max_pending)
-                return false;
+            {
+                if (_overflow_reported)
+                    return PushResult::dropped;
+                _overflow_reported = true;
+                return PushResult::dropped_first;
+            }
             _pending.push_back(std::move(request));
-            return true;
+            return PushResult::queued;
         }
 
         // Moves every pending request into `out` (which must be empty), preserving request order.
@@ -57,21 +72,30 @@ namespace stellar_rsb
         {
             std::lock_guard<std::mutex> lock(_lock);
             out.swap(_pending);
+            _overflow_reported = false;
         }
 
         // Puts `requests[from..]` back at the FRONT of the queue (ahead of anything pushed meanwhile), keeping their order.
-        void put_back_front(std::vector<Request> &requests, std::size_t from)
+        // The cap still holds: if the queue would exceed it, the NEWEST requests (at the back) are dropped. Returns how
+        // many were dropped.
+        std::size_t put_back_front(std::vector<Request> &requests, std::size_t from)
         {
             if (from >= requests.size())
-                return;
+                return 0;
             std::lock_guard<std::mutex> lock(_lock);
             _pending.insert(_pending.begin(), std::make_move_iterator(requests.begin() + static_cast<std::ptrdiff_t>(from)),
                 std::make_move_iterator(requests.end()));
+            if (_pending.size() <= max_pending)
+                return 0;
+            const std::size_t dropped = _pending.size() - max_pending;
+            _pending.erase(_pending.begin() + static_cast<std::ptrdiff_t>(max_pending), _pending.end());
+            return dropped;
         }
 
     private:
         std::mutex _lock;
         std::vector<Request> _pending;
+        bool _overflow_reported = false;
     };
 
     struct TechniqueState
@@ -114,6 +138,13 @@ namespace stellar_rsb
             _frames++;
         }
 
+        // Render thread: nothing changed this frame; the published snapshot is still current as of this frame.
+        void tick()
+        {
+            std::lock_guard<std::mutex> lock(_lock);
+            _frames++;
+        }
+
         void reset()
         {
             std::lock_guard<std::mutex> lock(_lock);
@@ -123,10 +154,11 @@ namespace stellar_rsb
             _current.loading = true;
         }
 
+        // Frames counted so far, clamped to INT_MAX for the int ABI.
         int frames()
         {
             std::lock_guard<std::mutex> lock(_lock);
-            return _frames;
+            return _frames > INT_MAX ? INT_MAX : static_cast<int>(_frames);
         }
 
         int loading()
@@ -170,6 +202,6 @@ namespace stellar_rsb
     private:
         std::mutex _lock;
         Snapshot _current;
-        int _frames = 0;
+        std::int64_t _frames = 0;
     };
 }
