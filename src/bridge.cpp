@@ -30,6 +30,7 @@
 #include <reshade.hpp>
 #include "bridge_state.hpp"
 #include "effect_files.hpp"
+#include "isolated.hpp"
 #include "loading_state.hpp"
 #include "overrides.hpp"
 #include "requests.hpp"
@@ -38,9 +39,10 @@ using namespace reshade::api;
 using namespace stellar_rsb;
 
 extern "C" __declspec(dllexport) const char *NAME = "Stellar ReShade bridge";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Lets the Stellar framework switch ReShade effects and draw them into photos.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Lets the Stellar framework switch ReShade effects and draw them into photos (v1.1.0).";
 
-static constexpr int bridge_abi_version = 1;
+static constexpr int bridge_abi_version = 1; // unchanged by additions: hosts bind exactly this value
+static constexpr const char *addon_version = "1.1.0";
 
 static constexpr int snapshot_refresh_frames = 60; // safety net for changes no event reports
 
@@ -118,6 +120,8 @@ static void publish_snapshot(effect_runtime *r, size_t count)
 
 static void on_init(effect_runtime *r)
 {
+    if (t_creating_isolated)
+        return; // the bridge's own isolated runtime is being created; it is not the game's runtime
     try
     {
         g_loading = true; // the first present after init reloads everything (source/runtime.cpp:567, 3663-3664)
@@ -135,9 +139,15 @@ static void on_destroy(effect_runtime *r)
 {
     try
     {
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_iso_lock);
+            if (isolated_owns(r))
+                return; // the isolated runtime being torn down by the bridge itself
+        }
         effect_runtime *expected = r;
         if (g_runtime.compare_exchange_strong(expected, nullptr))
         {
+            isolated_lost(); // built on the game runtime's device and settings; free it before that device can go away
             g_loading = true;
             g_known_empty = false;
             g_snapshot_dirty = true;
@@ -207,6 +217,19 @@ static bool on_set_technique_state(effect_runtime *r, effect_technique t, bool)
     }
     catch (...) {}
     return false; // never block the change
+}
+
+// Backstop for shutdown paths where the game's device goes away without its runtime being destroyed first. The isolated
+// runtime holds its own references to the device, so it is still valid here.
+static void on_destroy_device(device *d)
+{
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_iso_lock);
+        if (d != nullptr && g_iso.game_device != 0 && d->get_native() == g_iso.game_device)
+            isolated_lost();
+    }
+    catch (...) {}
 }
 
 static bool on_set_effects_state(effect_runtime *, bool) { g_snapshot_dirty = true; return false; }
@@ -453,6 +476,99 @@ extern "C" __declspec(dllexport) int rsb_last_render() { return g_last_render.lo
 
 extern "C" __declspec(dllexport) void *rsb_render_event_func() { return reinterpret_cast<void *>(&render_event); }
 
+// ---- Isolated capture (1.1.0): render a photo in a separate effect runtime whose back buffer has the photo's size. ----
+
+static void isolated_render_event(int)
+{
+    isolated_event(g_runtime.load(), g_counting, g_drawn);
+}
+
+extern "C" __declspec(dllexport) int rsb_addon_version(char *buf, int len)
+{
+    try { return copy_out(addon_version, buf, len); } catch (...) { return 0; }
+}
+
+extern "C" __declspec(dllexport) int rsb_isolated_begin(uint32_t width, uint32_t height, const char *config_path)
+{
+    try
+    {
+        if (config_path == nullptr || *config_path == '\0' || width == 0 || height == 0 ||
+            width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+            (width < 160 && height < 120)) // ReShade does not initialise on smaller targets (source/runtime.cpp:378-379)
+            return iso_err_bad_argument;
+        std::lock_guard<std::mutex> lock(g_iso_pending.lock);
+        const int state = g_iso_state.load();
+        if (state == iso_starting || state == iso_loading || state == iso_ready)
+            return iso_err_busy;
+        g_iso_pending.sequence++;
+        g_iso_pending.begin = true;
+        g_iso_pending.width = width;
+        g_iso_pending.height = height;
+        g_iso_pending.config_path = config_path;
+        g_iso_state = iso_starting;
+        g_iso_last_render = iso_render_no_runtime;
+        return 1;
+    }
+    catch (...)
+    {
+        return iso_err_internal;
+    }
+}
+
+extern "C" __declspec(dllexport) void rsb_isolated_end()
+{
+    void *texture = nullptr;
+    try
+    {
+        g_iso_requests.clear(); // requests belong to one session; the next one starts clean
+        std::lock_guard<std::mutex> lock(g_iso_pending.lock);
+        g_iso_pending.sequence++;
+        g_iso_pending.begin = false;
+        g_iso_pending.end = true;
+        texture = g_iso_pending.texture;
+        g_iso_pending.texture = nullptr;
+        g_iso_state = iso_ending;
+        g_iso_last_render = iso_render_no_runtime;
+    }
+    catch (...) {}
+    release_texture(texture);
+}
+
+extern "C" __declspec(dllexport) int rsb_isolated_state() { return g_iso_state.load(); }
+
+extern "C" __declspec(dllexport) void rsb_isolated_request_technique(const char *effect, const char *name, int on)
+{
+    try
+    {
+        if (!name || !*name)
+            return;
+        g_iso_requests.set(effect ? effect : "", name, on != 0);
+    }
+    catch (...) {}
+}
+
+extern "C" __declspec(dllexport) void rsb_isolated_queue_render(void *d3d11Texture)
+{
+    void *previous = nullptr;
+    try
+    {
+        if (d3d11Texture != nullptr)
+            static_cast<IUnknown *>(d3d11Texture)->AddRef();
+        {
+            std::lock_guard<std::mutex> lock(g_iso_pending.lock);
+            previous = g_iso_pending.texture;
+            g_iso_pending.texture = d3d11Texture;
+            g_iso_last_render = iso_render_none;
+        }
+        release_texture(previous);
+    }
+    catch (...) {}
+}
+
+extern "C" __declspec(dllexport) int rsb_isolated_last_render() { return g_iso_last_render.load(); }
+
+extern "C" __declspec(dllexport) void *rsb_isolated_event_func() { return reinterpret_cast<void *>(&isolated_render_event); }
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -461,6 +577,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             return FALSE;
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy);
+        reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
         reshade::register_event<reshade::addon_event::reshade_set_technique_state>(on_set_technique_state);
         reshade::register_event<reshade::addon_event::reshade_set_effects_state>(on_set_effects_state);
