@@ -34,6 +34,7 @@
 #include "loading_state.hpp"
 #include "overrides.hpp"
 #include "requests.hpp"
+#include "uniform_overrides.hpp"
 
 using namespace reshade::api;
 using namespace stellar_rsb;
@@ -137,6 +138,7 @@ static void on_init(effect_runtime *r)
 
 static void on_destroy(effect_runtime *r)
 {
+    uniform_overrides_forget(r);
     try
     {
         {
@@ -165,6 +167,7 @@ static void on_destroy(effect_runtime *r)
 // enable queued it). An empty list therefore identifies a start.
 static void on_reloaded_effects(effect_runtime *r)
 {
+    g_uniform_epoch++; // a load reset uniforms to their defaults (any runtime, isolated included)
     try
     {
         if (r != g_runtime.load())
@@ -233,7 +236,22 @@ static void on_destroy_device(device *d)
 }
 
 static bool on_set_effects_state(effect_runtime *, bool) { g_snapshot_dirty = true; return false; }
-static void on_set_preset_path(effect_runtime *, const char *) { g_snapshot_dirty = true; }
+static void on_set_preset_path(effect_runtime *, const char *)
+{
+    g_snapshot_dirty = true;
+    g_uniform_epoch++; // a preset was applied: its values replaced the overridden ones
+}
+
+static void on_begin_effects(effect_runtime *r, command_list *, resource_view, resource_view)
+{
+    uniform_overrides_before_effects(r);
+}
+
+static bool on_set_uniform_value(effect_runtime *r, effect_uniform_variable v, const void *, size_t)
+{
+    uniform_overrides_on_set(r, v);
+    return false; // never block the change; the override is re-applied before the next draw
+}
 static bool on_reorder_techniques(effect_runtime *, size_t, effect_technique *) { g_snapshot_dirty = true; return false; }
 
 // Render thread, inside ReShade's present (source/runtime.cpp:936, right before _effects_rendered_this_frame resets).
@@ -567,6 +585,25 @@ extern "C" __declspec(dllexport) void rsb_isolated_queue_render(void *d3d11Textu
 
 extern "C" __declspec(dllexport) int rsb_isolated_last_render() { return g_iso_last_render.load(); }
 
+extern "C" __declspec(dllexport) int rsb_set_uniform_override(const char *effect_file, const char *variable, const char *value)
+{
+    try
+    {
+        if (variable == nullptr || *variable == '\0')
+            return 0;
+        return g_uniform_overrides.set(effect_file ? effect_file : "", variable, value) ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+extern "C" __declspec(dllexport) void rsb_clear_uniform_overrides()
+{
+    try { g_uniform_overrides.clear(); } catch (...) {}
+}
+
 extern "C" __declspec(dllexport) void *rsb_isolated_event_func() { return reinterpret_cast<void *>(&isolated_render_event); }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
@@ -585,6 +622,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reorder_techniques>(on_reorder_techniques);
         reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
+        reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
+        reshade::register_event<reshade::addon_event::reshade_set_uniform_value>(on_set_uniform_value);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {

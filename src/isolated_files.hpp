@@ -132,6 +132,10 @@ namespace stellar_rsb
         text += "KeyNextPreset=0,0,0,0\n";
         text += "KeyPreviousPreset=0,0,0,0\n";
         text += "KeyScreenshot=0,0,0,0\n";
+        // Read from this file only, default on (runtime_gui.cpp:320). The runtime has no input and no visible overlay, so
+        // nothing should trigger an auto save; this makes sure of it.
+        text += "[OVERLAY]\n";
+        text += "AutoSavePreset=0\n";
         return write_file(config_path, text);
     }
 

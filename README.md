@@ -83,6 +83,8 @@ UTF-8. Functions that fill a buffer write a NUL-terminated string truncated to f
 | `int rsb_get_preset(char* buf, int len)` | length | Path of the current preset. |
 | `void rsb_request_preset(const char* path)` | — | Queue: switch to the preset at `path` (ignored by ReShade if it is not a valid preset). Request a preset only when `rsb_technique_count() > 0`; otherwise it is ignored and logged to ReShade's log. |
 | `void rsb_request_search_paths(const char* effects, const char* textures)` | — | Queue: set `EffectSearchPaths` / `TextureSearchPaths` in ReShade's config, then reload all effects. Each argument is a `;`-separated list; a null or empty argument leaves that setting unchanged. |
+| `int rsb_set_uniform_override(const char* effectFile, const char* variable, const char* value)` | `1`/`0` | Since 1.1.0. Keep the uniform `variable` of `effectFile` (as reported by ReShade, e.g. `AcerolaFX_End.fx`; null or empty = that variable in every effect) at `value` in every effect runtime, whatever preset is loaded, until cleared. `value` is a list of 1 to 16 numbers separated by `,` (`"0"`, `"1,0,0"`; `true`/`false` accepted), converted to the variable's type. A null or empty `value` removes that override. Returns `0` for a missing variable name or an unparsable value. See *Uniform overrides*. |
+| `void rsb_clear_uniform_overrides()` | — | Since 1.1.0. Removes every uniform override. Values already set stay until ReShade next loads a preset or effect. |
 | `void rsb_queue_render(void* d3d11Texture, uint32_t w, uint32_t h)` | — | Queue an `ID3D11Texture2D` (RGBA8, render-target capable) to draw the active effects into. The add-on holds a COM reference to it until the render event uses it or a later call replaces it. `w`/`h` are unused (the whole texture is drawn); they stay for ABI compatibility. Resets `rsb_last_render` to `0`. |
 | `int rsb_last_render()` | code | Meaningful only after the render event (`rsb_render_event_func`) for that queued texture has run. Result of the last render: `-1` no ReShade runtime, `-2` nothing queued, `-3` render-target view could not be created, otherwise the number of techniques drawn (`0` = nothing drawn yet, for example while ReShade compiles effects for a new texture size). |
 | `void* rsb_render_event_func()` | pointer | Render-event callback (`void (*)(int)`) for Unity's `GL.IssuePluginEvent`. It runs on the render thread and draws the queued texture. It assumes that thread also presents the swap chain, so ReShade cannot destroy its effect runtime while the callback runs. |
@@ -96,6 +98,27 @@ Notes:
 - ReShade leaves the alpha channel at `0` after drawing effects; set it yourself if you need an opaque image.
 - The add-on does not report which techniques use the depth buffer. A host that needs this derives it from the effect
   source file named by `rsb_technique_at`.
+
+## Uniform overrides (since 1.1.0)
+
+ReShade resets every uniform to its shader default whenever an effect is loaded or reloaded, and again before it applies
+a preset; a variable the preset file does not list keeps that default. Switching between presets with different
+`PreprocessorDefinitions` reloads every effect. And ReShade saves the **old** preset before every preset switch, whatever
+the auto-save setting, writing the current value of every uniform of every effect with an enabled technique. So a
+default that came from a missing key becomes a real key in the file at the next switch.
+
+`rsb_set_uniform_override` holds a value against all of this. The add-on applies the overrides to every effect runtime
+(the game's and an isolated one) in ReShade's `reshade_begin_effects` event, right before techniques are drawn, so no
+frame is drawn with the reset value. It re-applies after an override changes, when an effect load finishes, when a preset
+is applied, and when ReShade sets a variable that has an override (a preset load or an overlay edit). It also checks again
+every 120 frames. A value is written only when it differs. Overrides last until cleared; they are not saved by the
+add-on, but ReShade writes the overridden value into a preset whenever it saves one.
+
+Notes:
+
+- Uniform overrides apply to the isolated runtime too.
+- Arrays get element 0; fewer numbers than components set only the first components.
+- An overlay edit of an overridden variable is undone on the next frame.
 
 ## Isolated capture (since 1.1.0)
 
@@ -115,7 +138,9 @@ How it is built:
   next to it (`<config name>.preset.ini`). The config copies `EffectSearchPaths`, `TextureSearchPaths`,
   `PreprocessorDefinitions`, `PerformanceMode`, `IntermediateCachePath`, `NoEffectCache` and `NoDebugInfo` from the game
   runtime's config, sets `SkipLoadingDisabledEffects=1`, `NoReloadOnInit=0` and `PresetPath` to the copy, and turns off
-  every shortcut key, preset shortcut and gamepad navigation. The copy's technique list is the game runtime's **live**
+  every shortcut key, preset shortcut, gamepad navigation and `AutoSavePreset`. The isolated runtime never saves a
+  preset: it has no input and no visible overlay (the only places ReShade saves from besides a preset switch), the add-on
+  never switches its preset, and its preset path is the copy. The copy's technique list is the game runtime's **live**
   technique states at that moment (temporary overrides and unsaved toggles included), in the game's order, with the
   isolated technique requests (below) applied on top. Only effects with an enabled technique are compiled. Uniform values
   and per-effect preprocessor definitions come from the preset **file**: values changed in the overlay and not saved yet
